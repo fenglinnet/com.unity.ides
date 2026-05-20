@@ -10,14 +10,17 @@ using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using UnityEngine;
+using UnityEditor;
 using SimpleJSON;
 using IOPath = System.IO.Path;
+using Debug = UnityEngine.Debug;
 
 namespace Microsoft.Unity.VisualStudio.Editor
 {
 	internal class AntigravityInstallation : VisualStudioInstallation
 	{
 		private static readonly IGenerator _generator = GeneratorFactory.GetInstance(GeneratorStyle.SDK);
+		internal const string ReuseExistingWindowKey = "antigravity_reuse_existing_window";
 
 		public override bool SupportsAnalyzers
 		{
@@ -42,8 +45,10 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			if (!Directory.Exists(extensionsPath))
 				return null;
 
+			// Search for both new and legacy extension IDs
 			return Directory
-				.EnumerateDirectories(extensionsPath, $"{CloverExtensionId}*") // publisherid.extensionid
+				.EnumerateDirectories(extensionsPath, $"{CloverExtensionId}*", searchOption: SearchOption.TopDirectoryOnly)
+				.Concat(Directory.EnumerateDirectories(extensionsPath, $"{MicrosoftUnityExtensionId}*", searchOption: SearchOption.TopDirectoryOnly))
 				.OrderByDescending(n => n)
 				.FirstOrDefault();
 		}
@@ -54,7 +59,8 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			if (string.IsNullOrEmpty(vstuPath))
 				return Array.Empty<string>();
 
-			return GetAnalyzers(vstuPath); }
+			return GetAnalyzers(vstuPath);
+		}
 
 		public override IGenerator ProjectGenerator
 		{
@@ -115,12 +121,25 @@ namespace Microsoft.Unity.VisualStudio.Editor
 				if (manifestBase == null)
 					return false;
 
-				var manifestFullPath = IOPath.Combine(manifestBase, "resources", "app", "package.json");
-				if (File.Exists(manifestFullPath))
+				// New version stores version in product.json at install root
+				var productJsonPath = IOPath.Combine(manifestBase, "product.json");
+				if (File.Exists(productJsonPath))
 				{
-					var manifest = JsonUtility.FromJson<AntigravityManifest>(File.ReadAllText(manifestFullPath));
+					var manifest = JsonUtility.FromJson<AntigravityManifest>(File.ReadAllText(productJsonPath));
 					Version.TryParse(manifest.version.Split('-').First(), out version);
 					isPrerelease = manifest.version.ToLower().Contains("insider");
+				}
+
+				// Legacy version stores version in resources/app/package.json
+				if (version == null)
+				{
+					var manifestFullPath = IOPath.Combine(manifestBase, "resources", "app", "package.json");
+					if (File.Exists(manifestFullPath))
+					{
+						var manifest = JsonUtility.FromJson<AntigravityManifest>(File.ReadAllText(manifestFullPath));
+						Version.TryParse(manifest.version.Split('-').First(), out version);
+						isPrerelease = manifest.version.ToLower().Contains("insider");
+					}
 				}
 			}
 			catch (Exception)
@@ -150,6 +169,9 @@ namespace Microsoft.Unity.VisualStudio.Editor
 
 			foreach (var basePath in new[] {localAppPath, programFiles})
 			{
+				// New version: "Antigravity IDE" directory and exe name
+				candidates.Add(IOPath.Combine(basePath, "Antigravity IDE", "Antigravity IDE.exe"));
+				// Old version: "Antigravity" directory and exe name
 				candidates.Add(IOPath.Combine(basePath, "Antigravity", "Antigravity.exe"));
 			}
 #elif UNITY_EDITOR_OSX
@@ -237,6 +259,8 @@ namespace Microsoft.Unity.VisualStudio.Editor
 				var enablePatch = !File.Exists(IOPath.Combine(vscodeDirectory, ".vstupatchdisable"));
 
 				CreateRecommendedExtensionsFile(vscodeDirectory, enablePatch);
+				CreateLaunchFile(vscodeDirectory, enablePatch);
+				CreateSettingsFile(vscodeDirectory, enablePatch);
 			}
 			catch (IOException)
 			{
@@ -244,9 +268,12 @@ namespace Microsoft.Unity.VisualStudio.Editor
 		}
 
 		private const string CloverExtensionId = "november.clover-unity";
+		private const string MicrosoftUnityExtensionId = "visualstudotoolsforunity.vstuc";
+
+		// Legacy extension recommendations (clover)
 		private const string DefaultRecommendedExtensionsContent = @"{
     ""recommendations"": [
-      """+ CloverExtensionId + @"""
+      """ + CloverExtensionId + @"""
     ]
 }
 ";
@@ -282,15 +309,209 @@ namespace Microsoft.Unity.VisualStudio.Editor
 					extensions.Add(recommendationsKey, recommendations);
 				}
 
-				if (recommendations.Linq.Any(entry => entry.Value.Value == CloverExtensionId))
-					return;
+				// Add both new and legacy extension IDs if not already present
+				if (!recommendations.Linq.Any(entry => entry.Value.Value == MicrosoftUnityExtensionId))
+					recommendations.Add(MicrosoftUnityExtensionId);
 
-				recommendations.Add(CloverExtensionId);
+				if (!recommendations.Linq.Any(entry => entry.Value.Value == CloverExtensionId))
+					recommendations.Add(CloverExtensionId);
+
 				WriteAllTextFromJObject(extensionFile, extensions);
 			}
 			catch (Exception)
 			{
 				// do not fail if we cannot patch the extensions.json file
+			}
+		}
+
+		private const string DefaultLaunchFileContent = @"{
+    ""version"": ""0.2.0"",
+    ""configurations"": [
+        {
+            ""name"": ""Attach to Unity"",
+            ""type"": ""vstuc"",
+            ""request"": ""attach""
+        }
+    ]
+}";
+
+		private static void CreateLaunchFile(string vscodeDirectory, bool enablePatch)
+		{
+			var launchFile = IOPath.Combine(vscodeDirectory, "launch.json");
+			if (File.Exists(launchFile))
+			{
+				if (enablePatch)
+					PatchLaunchFile(launchFile);
+
+				return;
+			}
+
+			File.WriteAllText(launchFile, DefaultLaunchFileContent);
+		}
+
+		private static void PatchLaunchFile(string launchFile)
+		{
+			try
+			{
+				const string configurationsKey = "configurations";
+				const string typeKey = "type";
+
+				var content = File.ReadAllText(launchFile);
+				var launch = JSONNode.Parse(content);
+
+				var configurations = launch[configurationsKey] as JSONArray;
+				if (configurations == null)
+				{
+					configurations = new JSONArray();
+					launch.Add(configurationsKey, configurations);
+				}
+
+				if (configurations.Linq.Any(entry => entry.Value[typeKey]?.Value == "vstuc"))
+					return;
+
+				var defaultContent = JSONNode.Parse(DefaultLaunchFileContent);
+				configurations.Add(defaultContent[configurationsKey][0]);
+
+				WriteAllTextFromJObject(launchFile, launch);
+			}
+			catch (Exception)
+			{
+				// do not fail if we cannot patch the launch.json file
+			}
+		}
+
+		private void CreateSettingsFile(string vscodeDirectory, bool enablePatch)
+		{
+			var settingsFile = IOPath.Combine(vscodeDirectory, "settings.json");
+			if (File.Exists(settingsFile))
+			{
+				if (enablePatch)
+					PatchSettingsFile(settingsFile);
+
+				return;
+			}
+
+			const string excludes = @"    ""files.exclude"": {
+        ""**/.DS_Store"": true,
+        ""**/.git"": true,
+        ""**/.vs"": true,
+        ""**/.gitmodules"": true,
+        ""**/.vsconfig"": true,
+        ""**/*.booproj"": true,
+        ""**/*.pidb"": true,
+        ""**/*.suo"": true,
+        ""**/*.user"": true,
+        ""**/*.userprefs"": true,
+        ""**/*.unityproj"": true,
+        ""**/*.dll"": true,
+        ""**/*.exe"": true,
+        ""**/*.pdf"": true,
+        ""**/*.mid"": true,
+        ""**/*.midi"": true,
+        ""**/*.wav"": true,
+        ""**/*.gif"": true,
+        ""**/*.ico"": true,
+        ""**/*.jpg"": true,
+        ""**/*.jpeg"": true,
+        ""**/*.png"": true,
+        ""**/*.psd"": true,
+        ""**/*.tga"": true,
+        ""**/*.tif"": true,
+        ""**/*.tiff"": true,
+        ""**/*.3ds"": true,
+        ""**/*.3DS"": true,
+        ""**/*.fbx"": true,
+        ""**/*.FBX"": true,
+        ""**/*.lxo"": true,
+        ""**/*.LXO"": true,
+        ""**/*.ma"": true,
+        ""**/*.MA"": true,
+        ""**/*.obj"": true,
+        ""**/*.OBJ"": true,
+        ""**/*.asset"": true,
+        ""**/*.cubemap"": true,
+        ""**/*.flare"": true,
+        ""**/*.mat"": true,
+        ""**/*.meta"": true,
+        ""**/*.prefab"": true,
+        ""**/*.unity"": true,
+        ""build/"": true,
+        ""Build/"": true,
+        ""Library/"": true,
+        ""library/"": true,
+        ""obj/"": true,
+        ""Obj/"": true,
+        ""Logs/"": true,
+        ""logs/"": true,
+        ""ProjectSettings/"": true,
+        ""UserSettings/"": true,
+        ""temp/"": true,
+        ""Temp/"": true
+    }";
+
+			var content = @"{
+" + excludes + @",
+    ""dotnet.defaultSolution"": """ + IOPath.GetFileName(ProjectGenerator.SolutionFile()) + @"""
+}";
+
+			File.WriteAllText(settingsFile, content);
+		}
+
+		private void PatchSettingsFile(string settingsFile)
+		{
+			try
+			{
+				const string excludesKey = "files.exclude";
+				const string solutionKey = "dotnet.defaultSolution";
+
+				var content = File.ReadAllText(settingsFile);
+				var settings = JSONNode.Parse(content);
+
+				var excludes = settings[excludesKey] as JSONObject;
+				if (excludes == null)
+					return;
+
+				var patchList = new List<string>();
+				var patched = false;
+
+				// Remove files.exclude for solution+project files in the project root
+				foreach (var exclude in excludes)
+				{
+					if (!bool.TryParse(exclude.Value.Value, out var exc) || !exc)
+						continue;
+
+					var key = exclude.Key;
+
+					if (!key.EndsWith(".sln") && !key.EndsWith(".csproj"))
+						continue;
+
+					if (!Regex.IsMatch(key, @"^(\*\*[\\\/])?\*\.(sln|csproj)$"))
+						continue;
+
+					patchList.Add(key);
+					patched = true;
+				}
+
+				// Check default solution
+				var defaultSolution = settings[solutionKey];
+				var solutionFile = IOPath.GetFileName(ProjectGenerator.SolutionFile());
+				if (defaultSolution == null || defaultSolution.Value != solutionFile)
+				{
+					settings[solutionKey] = solutionFile;
+					patched = true;
+				}
+
+				if (!patched)
+					return;
+
+				foreach (var patch in patchList)
+					excludes.Remove(patch);
+
+				WriteAllTextFromJObject(settingsFile, settings);
+			}
+			catch (Exception)
+			{
+				// do not fail if we cannot patch the settings.json file
 			}
 		}
 
@@ -304,23 +525,71 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			}
 		}
 
-		public override bool Open(string path, int line, int column, string solution)
+		private Process FindRunningAntigravityWithSolution(string solutionPath)
 		{
-			var application = Path;
+			var normalizedTargetPath = solutionPath.Replace('\\', '/').TrimEnd('/').ToLowerInvariant();
 
-			line = Math.Max(1, line);
-			column = Math.Max(0, column);
+#if UNITY_EDITOR_WIN
+			// Keep as is for Windows platform since path already includes drive letter
+#else
+			// Ensure path starts with / for macOS and Linux platforms
+			if (!normalizedTargetPath.StartsWith("/"))
+			{
+				normalizedTargetPath = "/" + normalizedTargetPath;
+			}
+#endif
 
-			var directory = IOPath.GetDirectoryName(solution);
-			var workspace = TryFindWorkspace(directory);
+			var processes = new List<Process>();
 
-			var target = workspace ?? directory;
+			// Get process name list based on different operating systems
+#if UNITY_EDITOR_OSX
+			processes.AddRange(Process.GetProcessesByName("Antigravity"));
+			processes.AddRange(Process.GetProcessesByName("Antigravity Helper"));
+#elif UNITY_EDITOR_LINUX
+			processes.AddRange(Process.GetProcessesByName("antigravity"));
+			processes.AddRange(Process.GetProcessesByName("Antigravity"));
+#else
+			processes.AddRange(Process.GetProcessesByName("Antigravity"));
+			processes.AddRange(Process.GetProcessesByName("Antigravity IDE"));
+#endif
 
-			ProcessRunner.Start(string.IsNullOrEmpty(path)
-				? ProcessStartInfoFor(application, $"\"{target}\"")
-				: ProcessStartInfoFor(application, $"\"{target}\" -g \"{path}\":{line}:{column}"));
+			foreach (var process in processes)
+			{
+				try
+				{
+					var workspaces = ProcessRunner.GetProcessWorkspaces(process);
+					if (workspaces != null && workspaces.Length > 0)
+					{
+						foreach (var workspace in workspaces)
+						{
+							var normalizedWorkspaceDir = workspace.Replace('\\', '/').TrimEnd('/').ToLowerInvariant();
 
-			return true;
+#if UNITY_EDITOR_WIN
+							// Keep as is for Windows platform
+#else
+							// Ensure path starts with / for macOS and Linux platforms
+							if (!normalizedWorkspaceDir.StartsWith("/"))
+							{
+								normalizedWorkspaceDir = "/" + normalizedWorkspaceDir;
+							}
+#endif
+
+							if (string.Equals(normalizedWorkspaceDir, normalizedTargetPath, StringComparison.OrdinalIgnoreCase) ||
+								normalizedTargetPath.StartsWith(normalizedWorkspaceDir + "/", StringComparison.OrdinalIgnoreCase) ||
+								normalizedWorkspaceDir.StartsWith(normalizedTargetPath + "/", StringComparison.OrdinalIgnoreCase))
+							{
+								return process;
+							}
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Debug.LogError($"[Antigravity] Error checking process: {ex}");
+					continue;
+				}
+			}
+			return null;
 		}
 
 		private static string TryFindWorkspace(string directory)
@@ -330,6 +599,48 @@ namespace Microsoft.Unity.VisualStudio.Editor
 				return null;
 
 			return files[0];
+		}
+
+		public override bool Open(string path, int line, int column, string solution)
+		{
+			line = Math.Max(1, line);
+			column = Math.Max(0, column);
+
+			var directory = IOPath.GetDirectoryName(solution);
+			var application = Path;
+
+			var workspace = TryFindWorkspace(directory);
+			if (workspace == null)
+				workspace = directory;
+			directory = workspace;
+
+			if (EditorPrefs.GetBool(ReuseExistingWindowKey, false))
+			{
+				var existingProcess = FindRunningAntigravityWithSolution(directory);
+				if (existingProcess != null)
+				{
+					try
+					{
+						var args = string.IsNullOrEmpty(path) ?
+							$"--reuse-window \"{directory}\"" :
+							$"--reuse-window -g \"{path}\":{line}:{column}";
+
+						ProcessRunner.Start(ProcessStartInfoFor(application, args));
+						return true;
+					}
+					catch (Exception ex)
+					{
+						Debug.LogError($"[Antigravity] Error using existing instance: {ex}");
+					}
+				}
+			}
+
+			var newArgs = string.IsNullOrEmpty(path) ?
+				$"--new-window \"{directory}\"" :
+				$"--new-window \"{directory}\" -g \"{path}\":{line}:{column}";
+
+			ProcessRunner.Start(ProcessStartInfoFor(application, newArgs));
+			return true;
 		}
 
 		private static ProcessStartInfo ProcessStartInfoFor(string application, string arguments)

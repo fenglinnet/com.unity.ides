@@ -132,6 +132,16 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			GUILayout.Label($"<size=10><color=grey>{package.displayName} v{package.version} enabled</color></size>", style);
 			GUILayout.EndHorizontal();
 
+			if (installation is AntigravityInstallation)
+			{
+				var reuseWindow = EditorPrefs.GetBool(AntigravityInstallation.ReuseExistingWindowKey, false);
+				var newReuseWindow = EditorGUILayout.Toggle(new GUIContent("Reuse existing Antigravity window", "When enabled, opens files in an existing Antigravity window if found. When disabled, always opens a new window."), reuseWindow);
+				if (newReuseWindow != reuseWindow)
+					EditorPrefs.SetBool(AntigravityInstallation.ReuseExistingWindowKey, newReuseWindow);
+
+				EditorGUILayout.Space();
+			}
+
 			EditorGUILayout.LabelField("Generate .csproj files for:");
 			EditorGUI.indentLevel++;
 			SettingsButton(ProjectGenerationFlag.Embedded, "Embedded packages", "", installation);
